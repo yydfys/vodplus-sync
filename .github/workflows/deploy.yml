@@ -1,0 +1,75 @@
+# 自动同步上游 0o755/vodplus-sync 并部署到 Cloudflare（fork 专属）
+#   1) 拉上游 main，对齐代码（上游 force-push 改写历史也能处理）
+#   2) 重新加回我们自己的配置：关闭 workers.dev / preview_urls
+#   3) npm run deploy → 先应用 D1 迁移，再发布 Worker
+# 触发器：定时（每 6 小时）+ 手动 + push 到 main（跳过本 bot 自己的提交，防循环）
+name: 同步上游并部署 Cloudflare
+
+on:
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vodplus-sync-deploy
+  cancel-in-progress: false
+
+jobs:
+  sync-and-deploy:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'push' || github.actor != 'github-actions[bot]'
+    steps:
+      - name: 取出仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: 备份自家 workflow（reset 后要放回来）
+        run: |
+          mkdir -p /tmp/keep
+          cp .github/workflows/deploy.yml /tmp/keep/deploy.yml
+
+      - name: 同步上游 main
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+          git config --local user.name "vodplus-sync bot"
+          git config --local user.email "bot@yydf.invalid"
+          git remote add upstream https://github.com/0o755/vodplus-sync.git 2>/dev/null || true
+          git fetch --no-tags --prune upstream main
+          echo "上游 $(git rev-parse --short upstream/main) / 本地 $(git rev-parse --short HEAD)"
+          git reset --hard upstream/main
+          node -e 'const fs=require("fs");const p="wrangler.jsonc";let s=fs.readFileSync(p,"utf8");if(s.indexOf("\"workers_dev\"")<0){s=s.replace("  \"name\": \"vodplus-sync\",\n","  \"name\": \"vodplus-sync\",\n  // 只允许自定义域访问：关闭 workers.dev 子域与预览地址\n  \"workers_dev\": false,\n  \"preview_urls\": false,\n");fs.writeFileSync(p,s);console.log("已重新加入 workers_dev/preview_urls 关闭项");}else{console.log("workers_dev 配置已存在");}'
+          mkdir -p .github/workflows
+          cp /tmp/keep/deploy.yml .github/workflows/deploy.yml
+          git add -A
+          if git diff --cached --quiet; then
+            echo "与上游完全一致，无需推送"
+          else
+            git commit -m "chore: 同步上游代码并保留部署配置 [skip ci]"
+            # 同步 = 对齐上游，历史可能被上游改写，必须 force
+            git push --force "https://x-access-token:${GH_PAT}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main
+            echo "已推送到 fork main"
+          fi
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci --ignore-scripts
+
+      - name: 迁移 D1 并发布 Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: npm run deploy
